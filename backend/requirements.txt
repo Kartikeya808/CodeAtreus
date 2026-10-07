@@ -1,0 +1,49 @@
+# ── Core API ────────────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+python-dotenv==1.0.1
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+pyjwt[crypto]==2.10.1
+passlib[bcrypt]==1.7.4
+httpx==0.28.1          # GitHub OAuth token exchange + API calls
+
+# ── Database ────────────────────────────────────────────────────────────────
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg[binary]==3.2.3   # PostgreSQL driver (psycopg3)
+
+# ── Cache / Queue ─────────────────────────────────────────────────────────────
+redis==5.2.1
+celery==5.4.0
+
+# ── Repo cloning + static analysis ────────────────────────────────────────────
+GitPython==3.1.43
+tree-sitter==0.23.2
+# Bundled grammars. No cp313 release yet, so only install on <3.13 (the Docker
+# image is python:3.11); on 3.13 symbol extraction uses the regex fallback.
+tree-sitter-language-pack==0.4.0; python_version < "3.13"
+networkx==3.4.2
+
+# ── Embeddings + vector store ─────────────────────────────────────────────────
+chromadb==0.5.23
+# Embeddings are produced via a pluggable provider (see app/services/embeddings.py):
+#   - "fastembed" (default, local BGE-small) or
+#   - "jina" / "openai-compatible" remote endpoints.
+# fastembed 0.4.2 has no cp313 wheel; 0.5+ does. Pin per interpreter.
+fastembed==0.4.2; python_version < "3.13"
+fastembed>=0.5.0; python_version >= "3.13"
+
+# ── Agent orchestration / LLM ─────────────────────────────────────────────────
+langgraph==0.2.60
+langchain-core==0.3.28
+# OpenRouter is OpenAI-compatible; we call it over httpx (above) — no SDK lock-in.
+
+# ── Dev / test ────────────────────────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.25.0
+ruff==0.8.4
+mypy==1.14.0
