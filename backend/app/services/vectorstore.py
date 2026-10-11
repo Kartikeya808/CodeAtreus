@@ -98,9 +98,14 @@ class _ChromaStore:
 
         from app.services.embeddings import get_embedding_function
 
-        self._client = chromadb.PersistentClient(
-            path=str(Path(settings.chroma_persist_dir).expanduser())
-        )
+        if settings.chroma_mode == "http":
+            self._client = chromadb.HttpClient(
+                host=settings.chroma_host, port=settings.chroma_port
+            )
+        else:
+            self._client = chromadb.PersistentClient(
+                path=str(Path(settings.chroma_persist_dir).expanduser())
+            )
         self._collection = self._client.get_or_create_collection(
             name=collection, embedding_function=get_embedding_function()
         )

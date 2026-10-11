@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Secrets — never commit live credentials
+connectionstrings.txt
+.env
+.env.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

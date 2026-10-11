@@ -1,0 +1,265 @@
+===============================================================================
+CodeAtreus - Production Deployment & Scale-Up Guide
+===============================================================================
+
+OVERVIEW OF WHAT YOU'RE CHANGING
+-------------------------------------------------------------------------------
+Right now everything runs on one host with local disk: Postgres in a container,
+Redis in a container, ChromaDB as a local file, and cloned repos on a local
+volume. To scale, you replace each local piece with a networked/managed one and
+run the API and Celery workers as separate, replicated processes. There are
+THREE tiny code changes needed (DB pool, Chroma client mode, split migrations);
+everything else is config and provisioning.
+
+(This guide intentionally omits the optional "hardening" items: rate limiting,
+refresh-token denylist, TLS/reverse proxy, observability, model pre-baking.)
+
+
+===============================================================================
+STEP 1 - PROVISION THE MANAGED SERVICES
+===============================================================================
+Do these first; you'll need their connection strings in Step 3.
+
+1a. POSTGRES
+    Create a managed instance (AWS RDS, Google Cloud SQL, Neon, Supabase,
+    Render...). Note the host, port, db name, user, password. Know its
+    max_connections value (defaults are often 100).
+
+1b. REDIS
+    Create a managed Redis (ElastiCache, Upstash, Render...). Note the URL.
+    Celery uses 3 logical DBs (broker, result, cache). If the managed service
+    only gives db 0, point all three at the same URL; that's fine.
+
+1c. VECTOR STORE - run ChromaDB in SERVER mode (instead of the local file).
+    Simplest path is one container:
+
+        docker run -d --name chroma -p 8001:8000 \
+          -v chroma-data:/chroma/chroma \
+          chromadb/chroma:latest
+
+    Put it on a private network reachable by the API and all workers. Note its
+    host:port (e.g. chroma:8000).
+
+1d. CLONED-REPO STORAGE - the API and workers MUST share the clone directory,
+    because the worker clones and the API reads it back. Options:
+      - Easiest: keep API + workers on the same host/node and mount one shared
+        volume at CLONE_DIR.
+      - Multi-node: use a shared network filesystem (EFS/Filestore/NFS) mounted
+        at the same path on every API and worker container.
+
+
+===============================================================================
+STEP 2 - APPLY THE THREE CODE CHANGES SCALING REQUIRES
+===============================================================================
+These make the app read its scaling knobs from env instead of being hardcoded
+to local/single-host.
+
+2a. DATABASE CONNECTION POOL
+    In backend/app/core/config.py, add to the Settings class (Database section):
+
+        db_pool_size: int = 10
+        db_max_overflow: int = 20
+        db_pool_recycle: int = 1800
+
+    In backend/app/db/session.py, change the create_engine call to:
+
+        engine = create_engine(
+            settings.database_url,
+            connect_args=_connect_args,
+            pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_recycle=settings.db_pool_recycle,
+            future=True,
+        )
+
+    SIZING RULE: (db_pool_size + db_max_overflow) x (API replicas +
+    worker replicas x worker concurrency) must stay below Postgres
+    max_connections. Keep pool_size modest (10) and scale replicas, not pool
+    size.
+
+2b. CHROMADB SERVER MODE
+    In backend/app/core/config.py, add:
+
+        chroma_mode: str = "local"      # "local" (file) or "http" (server)
+        chroma_host: str = "chroma"
+        chroma_port: int = 8000
+
+    In backend/app/services/vectorstore.py, replace the client construction in
+    _ChromaStore.__init__ (currently lines 101-103) with:
+
+        if settings.chroma_mode == "http":
+            self._client = chromadb.HttpClient(
+                host=settings.chroma_host, port=settings.chroma_port
+            )
+        else:
+            self._client = chromadb.PersistentClient(
+                path=str(Path(settings.chroma_persist_dir).expanduser())
+            )
+
+    This keeps local mode working for dev and switches to the shared server in
+    production via one env var.
+
+2c. SPLIT OUT MIGRATIONS
+    Don't let replicated API containers all run "alembic upgrade head" on boot
+    and race each other. Remove the migration from the API start command
+    (Step 5) and run it as a one-shot job (Step 4).
+
+
+===============================================================================
+STEP 3 - WRITE THE PRODUCTION .env
+===============================================================================
+Copy backend/.env.example to backend/.env and fill it in. Required values:
+
+    # Application
+    ENVIRONMENT=production                 # disables the dev-login backdoor
+    CORS_ORIGINS=https://your-frontend-domain.com
+
+    # Security - generate with:
+    #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+    JWT_SECRET=<paste-the-generated-secret>
+
+    # GitHub OAuth (create an OAuth app at github.com/settings/developers)
+    GITHUB_CLIENT_ID=<your-id>
+    GITHUB_CLIENT_SECRET=<your-secret>
+    GITHUB_OAUTH_REDIRECT_URI=https://your-frontend-domain.com/login/callback
+
+    # Database (managed Postgres from Step 1a)
+    DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DBNAME
+
+    # Redis / Celery (managed Redis from Step 1b)
+    REDIS_URL=redis://HOST:6379/0
+    CELERY_BROKER_URL=redis://HOST:6379/1
+    CELERY_RESULT_BACKEND=redis://HOST:6379/2
+
+    # Vector store (Chroma server from Step 1c + code change 2b)
+    CHROMA_MODE=http
+    CHROMA_HOST=chroma          # hostname of the Chroma container/service
+    CHROMA_PORT=8000
+
+    # Cloned repos (shared path from Step 1d)
+    CLONE_DIR=/app/data/repos
+
+    # LLM - without this, chat/roadmap use the canned retrieval fallback
+    OPENROUTER_API_KEY=<your-openrouter-key>
+    LLM_MODEL=nvidia/nemotron-3.5-lightning:free
+
+    # DB pool (from code change 2a) - tune per Step 2a sizing rule
+    DB_POOL_SIZE=10
+    DB_MAX_OVERFLOW=20
+
+GitHub OAuth app: Settings -> Developer settings -> OAuth Apps -> New. Set the
+Authorization callback URL to exactly your GITHUB_OAUTH_REDIRECT_URI.
+
+
+===============================================================================
+STEP 4 - BUILD THE IMAGE AND RUN MIGRATIONS ONCE
+===============================================================================
+    cd backend
+    docker build -t codeatreus-api .
+
+    # one-shot migration job (run before API/workers; re-run on each deploy)
+    docker run --rm --env-file .env codeatreus-api alembic upgrade head
+
+Run this single container to completion before the API/worker replicas start.
+On every subsequent deploy that includes a new migration, run this same
+one-shot step first.
+
+
+===============================================================================
+STEP 5 - RUN THE API (REPLICATED)
+===============================================================================
+Use Gunicorn managing Uvicorn workers, NOT --reload. (gunicorn ships with the
+uvicorn[standard] stack; if missing, pip install gunicorn.)
+
+    docker run -d --name codeatreus-api \
+      --env-file .env \
+      -p 8000:8000 \
+      -v /shared/repodata:/app/data/repos \   # same shared volume as workers
+      codeatreus-api \
+      gunicorn app.main:app \
+        -k uvicorn.workers.UvicornWorker \
+        -w 4 --bind 0.0.0.0:8000 --timeout 120
+
+  - -w 4 = 4 worker processes per container; run multiple containers behind a
+    load balancer for more.
+  - LB health check endpoint: GET /api/health
+  - WebSocket note: indexing progress uses WS (/ws/indexing/{id}). The load
+    balancer must allow WebSocket upgrades; WS falls back to polling if blocked.
+
+
+===============================================================================
+STEP 6 - RUN CELERY WORKERS (REPLICATED)
+===============================================================================
+Workers do the heavy lifting (clone + embed). Scale them independently of API.
+
+    docker run -d --name codeatreus-worker \
+      --env-file .env \
+      -v /shared/repodata:/app/data/repos \    # SAME shared volume as the API
+      codeatreus-api \
+      celery -A app.worker.celery_app worker --loglevel=info --concurrency=2
+
+  - Run several of these containers to process more repos in parallel.
+  - --concurrency ~= cores available per container.
+  - They MUST mount the same CLONE_DIR volume as the API and point at the same
+    Chroma server.
+
+HOW DISPATCH WORKS: enqueue_indexing (app/services/indexing/dispatch.py) sends
+the job to Celery when the broker is reachable, and only falls back to an
+in-process thread if Celery is unavailable. With CELERY_BROKER_URL set and
+workers running, every import goes through the queue automatically.
+
+
+===============================================================================
+STEP 7 - BUILD AND DEPLOY THE FRONTEND
+===============================================================================
+The API base URL is baked in at build time via VITE_API_URL.
+
+    cd /Users/kartik/CODEATREUS/code-atreus
+    VITE_API_URL=https://your-api-domain.com/api npm run build
+
+This produces dist/. Serve it as static files from any CDN or static host
+(Netlify, Vercel, Cloudflare Pages, S3+CloudFront, or an nginx container). No
+SSR needed - it's a static SPA.
+
+NOTE: The frontend auto-calls /api/auth/dev-login on first load to get a token.
+In production that endpoint is DISABLED (ENVIRONMENT=production), so the real
+login path is GitHub OAuth via the button that hits /api/auth/github. Make sure
+the OAuth redirect URI matches Step 3.
+
+
+===============================================================================
+STEP 8 - VERIFY END-TO-END
+===============================================================================
+    # 1. API is up
+    curl https://your-api-domain.com/api/health
+
+    # 2. Postgres reachable (returns 404 "Not found" in prod, proving the route
+    #    and DB work - dev-login being disabled is expected prod behavior)
+    curl -X POST https://your-api-domain.com/api/auth/dev-login
+
+    # 3. Full loop: open the frontend, log in with GitHub, paste a small public
+    #    GitHub repo, and watch the 7-step indexing run. Overview/chat/graph/
+    #    search should all populate from real data.
+
+TROUBLESHOOTING:
+  - Indexing starts but overview never appears -> API and worker are not
+    sharing the same CLONE_DIR volume (Step 1d). The worker cloned to disk the
+    API can't see.
+  - Chat answers say "LLM key not configured" -> set OPENROUTER_API_KEY.
+
+
+===============================================================================
+SERVICE TOPOLOGY SUMMARY
+===============================================================================
+Component     | Dev (now)                       | Production (this guide)
+--------------+---------------------------------+-------------------------------
+Postgres      | compose container, local volume | managed instance (1a)
+Redis         | compose container               | managed Redis (1b)
+Vector store  | local Chroma file               | Chroma server, networked (1c+2b)
+Cloned repos  | local ./data/repos              | shared volume / NFS (1d)
+API           | uvicorn --reload, migrates boot | gunicorn + N uvicorn, replicated (5)
+Migrations    | on API boot                     | one-shot job (4 + 2c)
+Workers       | in-process thread fallback      | replicated Celery workers (6)
+Frontend      | npm run dev                     | static dist/ on CDN (7)
+===============================================================================

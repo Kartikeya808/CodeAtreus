@@ -38,6 +38,9 @@ class Settings(BaseSettings):
 
     # ── Database ─────────────────────────────────────────────────────────────
     database_url: str = "postgresql+psycopg://codeatreus:codeatreus@localhost:5432/codeatreus"
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_pool_recycle: int = 1800
 
     # ── Redis / Celery ───────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379/0"
@@ -46,6 +49,9 @@ class Settings(BaseSettings):
 
     # ── Vector store ─────────────────────────────────────────────────────────
     chroma_persist_dir: str = "./data/chroma"
+    chroma_mode: str = "local"  # "local" (file) or "http" (server)
+    chroma_host: str = "chroma"
+    chroma_port: int = 8000
 
     # ── Embeddings ───────────────────────────────────────────────────────────
     embedding_provider: str = "fastembed"

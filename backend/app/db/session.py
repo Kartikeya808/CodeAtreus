@@ -9,10 +9,19 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import settings
 
 # SQLite needs check_same_thread=False when shared across threads (tests/dev).
-_connect_args = (
-    {"check_same_thread": False}
-    if settings.database_url.startswith("sqlite")
-    else {}
+_is_sqlite = settings.database_url.startswith("sqlite")
+_connect_args = {"check_same_thread": False} if _is_sqlite else {}
+
+# SQLite uses a thread-local/static pool, so the size/overflow/recycle knobs
+# don't apply; only pass them for real (networked) databases.
+_pool_kwargs = (
+    {}
+    if _is_sqlite
+    else {
+        "pool_size": settings.db_pool_size,
+        "max_overflow": settings.db_max_overflow,
+        "pool_recycle": settings.db_pool_recycle,
+    }
 )
 
 engine = create_engine(
@@ -20,6 +29,7 @@ engine = create_engine(
     connect_args=_connect_args,
     pool_pre_ping=True,
     future=True,
+    **_pool_kwargs,
 )
 
 SessionLocal = sessionmaker(
