@@ -22,9 +22,9 @@ services:
     # Run migrations once per deploy, before traffic shifts (replaces the
     # old "migrate on boot" so replicas can never race — Step 2c).
     preDeployCommand: alembic upgrade head
-    # Single uvicorn process keeps WebSocket indexing-progress state in one
-    # place and in-process indexing threads on the one disk.
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # Start command comes from the Dockerfile CMD (Docker runtime ignores
+    # startCommand). It binds Render's $PORT; a single uvicorn process keeps
+    # WebSocket progress state and in-process indexing threads on one disk.
     disk:
       name: codeatreus-data
       mountPath: /app/data
