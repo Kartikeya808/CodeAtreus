@@ -1,0 +1,68 @@
+# Render Blueprint — CodeAtreus backend (single-service v1 topology).
+#
+# One web service runs the API; indexing runs IN-PROCESS (dispatch.py thread
+# fallback) rather than a separate Celery worker, because Render services cannot
+# share a persistent disk and the clone->index->serve handoff requires one
+# shared filesystem. Chroma runs in local-file mode on that same disk. Neon
+# provides Postgres; Vercel serves the frontend.
+#
+# Deploy: push this file, then in the Render dashboard: New > Blueprint, pick
+# this repo. Fill the `sync: false` secrets when prompted. A persistent disk
+# requires a paid instance (Starter, ~$7/mo); the free tier has no disk and
+# spins down on idle.
+services:
+  - type: web
+    name: codeatreus-api
+    runtime: docker
+    plan: starter            # needed for the persistent disk; free tier has none
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    healthCheckPath: /api/health
+    # Run migrations once per deploy, before traffic shifts (replaces the
+    # old "migrate on boot" so replicas can never race — Step 2c).
+    preDeployCommand: alembic upgrade head
+    # Single uvicorn process keeps WebSocket indexing-progress state in one
+    # place and in-process indexing threads on the one disk.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: codeatreus-data
+      mountPath: /app/data
+      sizeGB: 10
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      # Frontend origin (Vercel). Adjust if your Vercel project name differs.
+      - key: CORS_ORIGINS
+        value: https://codeatreus.vercel.app
+      # Vector store + clones live on the mounted disk.
+      - key: CHROMA_MODE
+        value: local
+      - key: CHROMA_PERSIST_DIR
+        value: /app/data/chroma
+      - key: CLONE_DIR
+        value: /app/data/repos
+      # Modest client-side pool; single service against Neon's pooler.
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "10"
+      - key: LLM_MODEL
+        value: nvidia/nemotron-3.5-lightning:free
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      # GitHub OAuth redirect must point at the deployed frontend callback.
+      - key: GITHUB_OAUTH_REDIRECT_URI
+        value: https://codeatreus.vercel.app/login/callback
+      # Render auto-generates a strong value and keeps it stable across deploys.
+      - key: JWT_SECRET
+        generateValue: true
+      # --- Secrets: paste these in the Render dashboard (never committed) ---
+      - key: DATABASE_URL
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
