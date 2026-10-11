@@ -24,12 +24,20 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(
         default=["http://localhost:5173", "http://127.0.0.1:5173"]
     )
+    # Regex alternative to the explicit list — handy when the frontend origin
+    # varies (e.g. Vercel preview/per-deploy URLs). Empty disables it.
+    cors_origin_regex: str = ""
 
     # ── Security / JWT ───────────────────────────────────────────────────────
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
+
+    # Allow passwordless "guest" login in production: each call provisions a
+    # fresh, isolated anonymous account (clean slate per new visitor). Off by
+    # default; enable for a public demo that shouldn't require GitHub OAuth.
+    allow_guest_login: bool = False
 
     # ── GitHub OAuth ─────────────────────────────────────────────────────────
     github_client_id: str = ""

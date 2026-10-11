@@ -6,6 +6,8 @@ OAuth credentials are provisioned.
 """
 from __future__ import annotations
 
+import uuid
+
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -79,9 +81,31 @@ def me(user: User = Depends(get_current_user)) -> User:
 
 @router.post("/dev-login", response_model=TokenPair)
 def dev_login(db: Session = Depends(get_db)) -> TokenPair:
-    """Create/return a throwaway local user and issue tokens. Non-production only."""
-    if settings.is_production:
+    """Issue tokens without GitHub OAuth.
+
+    - Outside production: returns a stable shared "dev" user (convenient for
+      local development — your imported repos persist across reloads).
+    - In production with ALLOW_GUEST_LOGIN=true: provisions a *fresh, unique*
+      anonymous account on every call, so each new visitor gets an isolated
+      clean slate. Disabled (404) when guest login is off.
+    """
+    if settings.is_production and not settings.allow_guest_login:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    if settings.is_production:
+        # Clean slate per new visitor: a brand-new user each time. The browser
+        # keeps this user's token in localStorage, so it stays "theirs" until
+        # the token is cleared; a never-before-seen browser gets an empty one.
+        suffix = uuid.uuid4().hex[:12]
+        user = User(
+            github_login=f"guest-{suffix}",
+            name="Guest",
+            email=f"guest-{suffix}@codeatreus.local",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return TokenPair(**create_token_pair(user.id))
 
     user = db.scalar(select(User).where(User.github_login == "dev"))
     if user is None:
