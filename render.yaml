@@ -1,41 +1,38 @@
 # Render Blueprint — CodeAtreus backend (single-service v1 topology).
 #
 # One web service runs the API; indexing runs IN-PROCESS (dispatch.py thread
-# fallback) rather than a separate Celery worker, because Render services cannot
-# share a persistent disk and the clone->index->serve handoff requires one
-# shared filesystem. Chroma runs in local-file mode on that same disk. Neon
-# provides Postgres; Vercel serves the frontend.
+# fallback) rather than a separate Celery worker: the clone->index->serve
+# handoff needs one shared filesystem. Chroma runs in local-file mode.
+# Neon provides (persistent) Postgres; Vercel serves the frontend.
+#
+# FREE TIER: no persistent disk, so cloned repos and the Chroma index are
+# EPHEMERAL — wiped on restart / idle spin-down. Re-index a repo after a cold
+# start to restore chat/search. For always-on storage, switch plan to `starter`
+# and add a `disk:` mounted at /app/data (then repos/Chroma survive restarts).
 #
 # Deploy: push this file, then in the Render dashboard: New > Blueprint, pick
-# this repo. Fill the `sync: false` secrets when prompted. A persistent disk
-# requires a paid instance (Starter, ~$7/mo); the free tier has no disk and
-# spins down on idle.
+# this repo. Fill the `sync: false` secrets when prompted.
 services:
   - type: web
     name: codeatreus-api
     runtime: docker
-    plan: starter            # needed for the persistent disk; free tier has none
+    plan: free               # no persistent disk; filesystem is EPHEMERAL
     rootDir: backend
     dockerfilePath: ./Dockerfile
     region: oregon
     healthCheckPath: /api/health
-    # Run migrations once per deploy, before traffic shifts (replaces the
-    # old "migrate on boot" so replicas can never race — Step 2c).
-    preDeployCommand: alembic upgrade head
-    # Start command comes from the Dockerfile CMD (Docker runtime ignores
-    # startCommand). It binds Render's $PORT; a single uvicorn process keeps
-    # WebSocket progress state and in-process indexing threads on one disk.
-    disk:
-      name: codeatreus-data
-      mountPath: /app/data
-      sizeGB: 10
+    # Free tier has no pre-deploy step, so run migrations at container start
+    # before uvicorn (safe here: a single free instance, no replica race).
+    # dockerCommand overrides the Dockerfile CMD; it binds Render's $PORT.
+    dockerCommand: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: ENVIRONMENT
         value: production
       # Frontend origin (Vercel). Adjust if your Vercel project name differs.
       - key: CORS_ORIGINS
         value: https://codeatreus.vercel.app
-      # Vector store + clones live on the mounted disk.
+      # Vector store + clones live on the ephemeral filesystem (wiped on
+      # restart/spin-down on free tier). Postgres data persists in Neon.
       - key: CHROMA_MODE
         value: local
       - key: CHROMA_PERSIST_DIR
