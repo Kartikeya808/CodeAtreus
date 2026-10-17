@@ -64,6 +64,38 @@ def clone_repo(clone_url: str, branch: str, repo_id: str) -> Path:
     return dest
 
 
+def head_commit_sha(path: Path) -> str | None:
+    """Return the HEAD commit sha of a local clone, or None on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
+
+
+def remote_head_sha(clone_url: str, branch: str) -> str | None:
+    """Return the remote's HEAD sha for ``branch`` via ``git ls-remote``.
+
+    Used to decide whether a re-import actually needs to re-index. Returns None
+    on any failure so the caller falls back to a full re-index.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", clone_url, branch, f"refs/heads/{branch}", "HEAD"],
+            capture_output=True, text=True, timeout=20, env=env,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    # First column of the first line is the sha.
+    return proc.stdout.split()[0].strip() or None
+
+
 def _enforce_size_limit(path: Path) -> None:
     max_bytes = settings.max_repo_size_mb * 1024 * 1024
     total = 0

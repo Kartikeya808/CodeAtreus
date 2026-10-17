@@ -36,8 +36,8 @@ def build_messages(question: str, context_blocks: Iterable[tuple[str, str]]) -> 
     ]
 
 
-def llm_configured() -> bool:
-    return bool(settings.openrouter_api_key)
+def llm_configured(api_key: str | None = None) -> bool:
+    return bool(api_key or settings.openrouter_api_key)
 
 
 def _fallback_answer(question: str, context_blocks: list[tuple[str, str]]) -> str:
@@ -62,9 +62,15 @@ def _fallback_answer(question: str, context_blocks: list[tuple[str, str]]) -> st
     )
 
 
-async def complete(question: str, context_blocks: list[tuple[str, str]]) -> dict:
-    """Non-streaming completion. Returns {answer, usage}."""
-    if not llm_configured():
+async def complete(
+    question: str, context_blocks: list[tuple[str, str]], api_key: str | None = None
+) -> dict:
+    """Non-streaming completion. Returns {answer, usage}.
+
+    ``api_key`` (a user's BYO OpenRouter key) takes precedence over the env key.
+    """
+    key = api_key or settings.openrouter_api_key
+    if not key:
         return {"answer": _fallback_answer(question, context_blocks), "usage": None}
 
     payload = {
@@ -73,7 +79,7 @@ async def complete(question: str, context_blocks: list[tuple[str, str]]) -> dict
         "temperature": 0.2,
     }
     headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://codeatreus.local",
         "X-Title": "CodeAtreus",
@@ -96,9 +102,12 @@ async def complete(question: str, context_blocks: list[tuple[str, str]]) -> dict
         return {"answer": _fallback_answer(question, context_blocks), "usage": None}
 
 
-async def stream(question: str, context_blocks: list[tuple[str, str]]) -> AsyncIterator[str]:
+async def stream(
+    question: str, context_blocks: list[tuple[str, str]], api_key: str | None = None
+) -> AsyncIterator[str]:
     """Yield answer text chunks for SSE. Falls back to a single chunk offline."""
-    if not llm_configured():
+    key = api_key or settings.openrouter_api_key
+    if not key:
         yield _fallback_answer(question, context_blocks)
         return
 
@@ -109,7 +118,7 @@ async def stream(question: str, context_blocks: list[tuple[str, str]]) -> AsyncI
         "stream": True,
     }
     headers = {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://codeatreus.local",
         "X-Title": "CodeAtreus",

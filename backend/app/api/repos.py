@@ -1,20 +1,29 @@
 """Repository import + management endpoints (Phase 1.2)."""
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.core.logging import get_logger
 from app.db.session import get_db
 from app.models.index_job import TOTAL_STEPS, IndexJob, IndexStatus
 from app.models.repo import Repo, RepoStatus
 from app.models.user import User
 from app.schemas.indexing import IndexStatusOut, OverviewOut
 from app.schemas.repo import RepoImportRequest, RepoImportResponse, RepoOut
+from app.services import crypto
 from app.services.github_repo import InvalidRepoURL, fetch_repo_meta, validate_github_url
 from app.services.indexing import enqueue_indexing
+from app.services.indexing.clone import remote_head_sha
 from app.services.presenter import repo_to_card
+from app.services.vectorstore import VectorStore
+
+logger = get_logger("api.repos")
 
 router = APIRouter()
 
@@ -24,6 +33,24 @@ def _get_owned_repo(repo_id: str, user: User, db: Session) -> Repo:
     if repo is None or repo.owner_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repo not found")
     return repo
+
+
+def teardown_repo_artifacts(repo: Repo) -> None:
+    """Drop a repo's index artifacts: vector collection + local clone on disk.
+
+    Best-effort — logs and continues on failure so a partial teardown never
+    blocks deleting the DB row. Does not commit; the caller owns the session.
+    """
+    if repo.chroma_collection:
+        try:
+            VectorStore(repo.chroma_collection).delete()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("vector store teardown failed for %s: %s", repo.id, exc)
+    if repo.local_path:
+        try:
+            shutil.rmtree(Path(repo.local_path).expanduser(), ignore_errors=True)
+        except OSError as exc:
+            logger.info("clone dir teardown failed for %s: %s", repo.id, exc)
 
 
 @router.post("/import", response_model=RepoImportResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -45,7 +72,7 @@ async def import_repo(
         select(Repo).where(Repo.owner_id == user.id, Repo.full_name == ref.full_name)
     )
     try:
-        meta = await fetch_repo_meta(ref, token=user.github_access_token)
+        meta = await fetch_repo_meta(ref, token=crypto.decrypt(user.github_access_token))
     except InvalidRepoURL as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -60,6 +87,16 @@ async def import_repo(
     repo.default_branch = meta.default_branch
     repo.description = meta.description
     repo.stars = meta.stars
+
+    # Incremental re-index skip (Phase 4.6): if the repo is already indexed at
+    # the current remote HEAD, there's nothing to re-embed — return as-is.
+    if repo.status == RepoStatus.ready and repo.indexed_commit_sha:
+        remote_sha = remote_head_sha(ref.clone_url, meta.default_branch)
+        if remote_sha and remote_sha == repo.indexed_commit_sha:
+            db.commit()
+            db.refresh(repo)
+            return RepoImportResponse(repo_id=repo.id, status=repo.status, job_id=None)
+
     repo.status = RepoStatus.queued
 
     job = IndexJob(repo=repo, status=IndexStatus.queued, label="Queued")
@@ -135,10 +172,33 @@ def repo_overview(
     )
 
 
+@router.delete("/{repo_id}/index", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+def delete_repo_index(
+    repo_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    """Drop the repo's index (embeddings + graph + clone) but keep the row.
+
+    Leaves the repo in ``queued`` so the UI shows it needs re-indexing; a fresh
+    import of the same URL re-runs the pipeline.
+    """
+    repo = _get_owned_repo(repo_id, user, db)
+    teardown_repo_artifacts(repo)
+    repo.overview = None
+    repo.graph = None
+    repo.architecture = None
+    repo.chroma_collection = None
+    repo.local_path = None
+    repo.health_score = None
+    repo.status = RepoStatus.queued
+    db.add(repo)
+    db.commit()
+
+
 @router.delete("/{repo_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 def delete_repo(
     repo_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> None:
     repo = _get_owned_repo(repo_id, user, db)
+    teardown_repo_artifacts(repo)
     db.delete(repo)
     db.commit()

@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, createContext, useContext } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  Auth, Repos, Dashboard, chatStream, setToken, getToken,
+  Auth, Repos, Dashboard, UserApi, chatStream, setToken, getToken, ApiError,
   type RepoCard, type Overview as OverviewData,
   type GraphData, type GraphNode, type FlowStep, type SearchResult, type RoadmapDay,
-  type SequenceData, type DashboardStats,
+  type SequenceData, type DashboardStats, type Profile, type ApiKeys, type Usage,
+  type SecurityReport, type DeadCodeItem, type DriftReport, type TimelineReport,
+  type ApiDocs,
 } from './api'
 import {
   LayoutDashboard, GitBranch, MessageSquare, Search, Settings,
@@ -38,7 +40,7 @@ import {
 type Page =
   | 'landing' | 'login' | 'dashboard' | 'import' | 'indexing'
   | 'overview' | 'chat' | 'graph' | 'flow' | 'sequence'
-  | 'roadmap' | 'search' | 'settings'
+  | 'roadmap' | 'search' | 'security' | 'insights' | 'timeline' | 'apidocs' | 'settings'
 
 interface Repo {
   id: string; name: string; language: string; framework: string
@@ -160,6 +162,13 @@ const fadeIn = {
 
 // ── Shared UI primitives ───────────────────────────────────────────────────
 
+// Compact token count: 1_240_000 → "1.24M", 4_200 → "4.2K".
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return n.toLocaleString()
+}
+
 function Badge({ children, color = 'blue' }: { children: React.ReactNode; color?: string }) {
   const colors: Record<string, string> = {
     blue: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
@@ -226,6 +235,10 @@ function Sidebar({ page, setPage, isDark }: { page: Page; setPage: (p: Page) => 
     { id: 'sequence', label: 'Sequence Diagrams', icon: Layers },
     { id: 'roadmap', label: 'Learning Roadmap', icon: Map },
     { id: 'search', label: 'Search', icon: Search },
+    { id: 'security', label: 'Security', icon: Shield },
+    { id: 'insights', label: 'Code Insights', icon: Gauge },
+    { id: 'timeline', label: 'Timeline', icon: GitCommit },
+    { id: 'apidocs', label: 'API Docs', icon: Braces },
   ] as const
 
   const bottom = [
@@ -1384,13 +1397,22 @@ function ChatPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: 
         const res = await Repos.chat(repoId, q)
         patchAssistant(() => ({ role: 'assistant', content: res.answer, files: res.files }))
       }
-    } catch {
+    } catch (err) {
+      // Monthly token budget exhausted — surface the actionable message.
+      if (err instanceof ApiError && err.status === 429) {
+        patchAssistant(() => ({ role: 'assistant', content: `⚠️ ${err.message}`, files: [] }))
+        setSending(false)
+        return
+      }
       // Streaming failed — try the non-streaming endpoint before giving up.
       try {
         const res = await Repos.chat(repoId, q)
         patchAssistant(() => ({ role: 'assistant', content: res.answer, files: res.files }))
-      } catch {
-        patchAssistant(() => ({ role: 'assistant', content: 'I could not reach the analysis backend. Please make sure the repository has finished indexing.', files: [] }))
+      } catch (err2) {
+        const msg = err2 instanceof ApiError && err2.status === 429
+          ? `⚠️ ${err2.message}`
+          : 'I could not reach the analysis backend. Please make sure the repository has finished indexing.'
+        patchAssistant(() => ({ role: 'assistant', content: msg, files: [] }))
       }
     } finally {
       setSending(false)
@@ -2278,11 +2300,513 @@ function SearchPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark
   )
 }
 
+// ── Page: Security ─────────────────────────────────────────────────────────
+
+const SECURITY_MOCK: SecurityReport = {
+  secrets: [
+    { file: 'src/config/db.ts', line: 12, rule: 'Generic Secret Assignment', severity: 'medium', preview: 'pg_p…x9f2' },
+  ],
+  vulnerabilities: [
+    { package: 'lodash', version: '4.17.19', ecosystem: 'npm', id: 'GHSA-p6mc-m468-83gw', severity: 'high', summary: 'Prototype pollution in lodash', fixed_in: '4.17.21' },
+  ],
+  dependencies_scanned: 42,
+  scanned_at: '',
+}
+
+function SecurityPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: (v: boolean) => void; setPage: (p: Page) => void }) {
+  const { repoId, ensureAuth } = useAppState()
+  const [data, setData] = useState<SecurityReport>(SECURITY_MOCK)
+  const [loading, setLoading] = useState(false)
+  const [live, setLive] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      if (!repoId) return
+      setLoading(true)
+      await ensureAuth()
+      try {
+        const r = await Repos.security(repoId)
+        if (!active) return
+        setData(r); setLive(true)
+      } catch { /* keep mock */ }
+      finally { if (active) setLoading(false) }
+    })()
+    return () => { active = false }
+  }, [repoId])
+
+  const c = isDark ? {
+    bg: 'bg-[#242C4D]', surface: 'bg-[#2D355C]', border: 'border-white/[0.06]',
+    text: 'text-white/80', muted: 'text-white/35', heading: 'text-white',
+  } : {
+    bg: 'bg-[#F8F9FC]', surface: 'bg-white', border: 'border-gray-100',
+    text: 'text-gray-700', muted: 'text-gray-400', heading: 'text-gray-900',
+  }
+
+  const sevColor = (s: string): string =>
+    s === 'high' || s === 'critical' ? 'red' : s === 'medium' || s === 'scored' ? 'amber' : 'slate'
+
+  const totalIssues = data.secrets.length + data.vulnerabilities.length
+
+  return (
+    <div className={`flex-1 overflow-y-auto ${c.bg}`}>
+      <TopBar title="Security" isDark={isDark} setIsDark={setIsDark} setPage={setPage}
+        breadcrumbs={[{ label: 'Dashboard', page: 'dashboard' }, { label: 'CodeAtreus' }, { label: 'Security' }]} />
+      <div className="p-6 max-w-4xl">
+        <div className="flex items-center justify-between mb-1">
+          <h1 className={`font-serif text-2xl ${c.heading}`}>Security Insights</h1>
+          {loading && <Loader2 className="w-4 h-4 animate-spin text-blue-400" />}
+        </div>
+        <p className={`text-sm mb-6 ${c.muted}`}>
+          Secret scan + dependency vulnerabilities (OSV.dev).{' '}
+          {!repoId ? 'Select a repository to scan.' : live ? `${totalIssues} issue(s) found.` : 'Showing sample data.'}
+        </p>
+
+        {/* Summary tiles */}
+        <div className="grid grid-cols-3 gap-3 mb-6">
+          {[
+            { label: 'Secrets Exposed', value: data.secrets.length, icon: Key, color: data.secrets.length ? 'text-red-400' : 'text-emerald-400' },
+            { label: 'Vulnerable Deps', value: data.vulnerabilities.length, icon: AlertCircle, color: data.vulnerabilities.length ? 'text-amber-400' : 'text-emerald-400' },
+            { label: 'Deps Scanned', value: data.dependencies_scanned, icon: Package, color: 'text-blue-400' },
+          ].map(s => (
+            <div key={s.label} className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+              <s.icon className={`w-4 h-4 mb-2 ${s.color}`} />
+              <div className={`text-xl font-semibold ${c.heading}`}>{s.value}</div>
+              <div className={`text-xs ${c.muted}`}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Secrets */}
+        <h2 className={`font-serif text-lg mb-3 ${c.heading}`}>Exposed Secrets</h2>
+        {data.secrets.length === 0 ? (
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4 mb-6 flex items-center gap-2 text-sm ${c.muted}`}>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" /> No secrets detected.
+          </div>
+        ) : (
+          <div className="space-y-2 mb-6">
+            {data.secrets.map((s, i) => (
+              <div key={i} className={`${c.surface} border ${c.border} rounded-xl p-4 flex items-center justify-between`}>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-medium ${c.heading}`}>{s.rule}</span>
+                    <Badge color={sevColor(s.severity)}>{s.severity}</Badge>
+                  </div>
+                  <div className={`text-[11px] font-mono mt-1 ${c.muted}`}>{s.file}:{s.line}</div>
+                </div>
+                <code className={`text-[11px] font-mono shrink-0 ml-4 ${c.muted}`}>{s.preview}</code>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Vulnerabilities */}
+        <h2 className={`font-serif text-lg mb-3 ${c.heading}`}>Dependency Vulnerabilities</h2>
+        {data.vulnerabilities.length === 0 ? (
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4 flex items-center gap-2 text-sm ${c.muted}`}>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" /> No known vulnerabilities.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {data.vulnerabilities.map((v, i) => (
+              <div key={i} className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+                <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-mono font-medium ${c.heading}`}>{v.package}@{v.version}</span>
+                    <Badge color={sevColor(v.severity)}>{v.severity}</Badge>
+                    <span className={`text-[10px] ${c.muted}`}>{v.ecosystem}</span>
+                  </div>
+                  <span className={`text-[10px] font-mono ${c.muted}`}>{v.id}</span>
+                </div>
+                <div className={`text-xs ${c.text}`}>{v.summary}</div>
+                {v.fixed_in && <div className={`text-[11px] mt-1 text-emerald-400`}>Fixed in {v.fixed_in}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Page: Code Insights (dead code + architecture drift) ─────────────────────
+
+const DEADCODE_MOCK: DeadCodeItem[] = [
+  { file: 'src/utils/legacy.ts', symbol: 'formatOldDate', kind: 'function', confidence: 'low' },
+  { file: 'src/types/unused.ts', symbol: '(whole file)', kind: 'orphan-file', confidence: 'low' },
+]
+const DRIFT_MOCK: DriftReport = {
+  violations: [
+    { from: 'UserRepo', to: 'AuthController', from_layer: 'repo', to_layer: 'controller', rule: 'upward-dependency' },
+  ],
+  score: 86,
+  edges_checked: 7,
+}
+
+function InsightsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: (v: boolean) => void; setPage: (p: Page) => void }) {
+  const { repoId, ensureAuth } = useAppState()
+  const [deadCode, setDeadCode] = useState<DeadCodeItem[]>(DEADCODE_MOCK)
+  const [drift, setDrift] = useState<DriftReport>(DRIFT_MOCK)
+  const [loading, setLoading] = useState(false)
+  const [live, setLive] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      if (!repoId) return
+      setLoading(true)
+      await ensureAuth()
+      try {
+        const [dc, dr] = await Promise.all([Repos.deadCode(repoId), Repos.drift(repoId)])
+        if (!active) return
+        setDeadCode(dc); setDrift(dr); setLive(true)
+      } catch { /* keep mock */ }
+      finally { if (active) setLoading(false) }
+    })()
+    return () => { active = false }
+  }, [repoId])
+
+  const c = isDark ? {
+    bg: 'bg-[#242C4D]', surface: 'bg-[#2D355C]', border: 'border-white/[0.06]',
+    text: 'text-white/80', muted: 'text-white/35', heading: 'text-white',
+  } : {
+    bg: 'bg-[#F8F9FC]', surface: 'bg-white', border: 'border-gray-100',
+    text: 'text-gray-700', muted: 'text-gray-400', heading: 'text-gray-900',
+  }
+
+  const driftColor = drift.score >= 90 ? 'text-emerald-400' : drift.score >= 70 ? 'text-amber-400' : 'text-red-400'
+
+  return (
+    <div className={`flex-1 overflow-y-auto ${c.bg}`}>
+      <TopBar title="Code Insights" isDark={isDark} setIsDark={setIsDark} setPage={setPage}
+        breadcrumbs={[{ label: 'Dashboard', page: 'dashboard' }, { label: 'CodeAtreus' }, { label: 'Code Insights' }]} />
+      <div className="p-6 max-w-4xl">
+        <div className="flex items-center justify-between mb-1">
+          <h1 className={`font-serif text-2xl ${c.heading}`}>Code Insights</h1>
+          {loading && <Loader2 className="w-4 h-4 animate-spin text-blue-400" />}
+        </div>
+        <p className={`text-sm mb-6 ${c.muted}`}>
+          Dead-code candidates and architecture-drift violations.{' '}
+          {!repoId ? 'Select a repository to analyse.' : live ? 'Live analysis.' : 'Showing sample data.'}
+        </p>
+
+        {/* Drift score + summary */}
+        <div className="grid grid-cols-3 gap-3 mb-6">
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+            <Gauge className={`w-4 h-4 mb-2 ${driftColor}`} />
+            <div className={`text-xl font-semibold ${driftColor}`}>{drift.score}</div>
+            <div className={`text-xs ${c.muted}`}>Architecture Score</div>
+          </div>
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+            <GitMerge className={`w-4 h-4 mb-2 ${drift.violations.length ? 'text-amber-400' : 'text-emerald-400'}`} />
+            <div className={`text-xl font-semibold ${c.heading}`}>{drift.violations.length}</div>
+            <div className={`text-xs ${c.muted}`}>Drift Violations</div>
+          </div>
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+            <Trash2 className={`w-4 h-4 mb-2 ${deadCode.length ? 'text-amber-400' : 'text-emerald-400'}`} />
+            <div className={`text-xl font-semibold ${c.heading}`}>{deadCode.length}</div>
+            <div className={`text-xs ${c.muted}`}>Dead-Code Items</div>
+          </div>
+        </div>
+
+        {/* Drift violations */}
+        <h2 className={`font-serif text-lg mb-3 ${c.heading}`}>Architecture Drift</h2>
+        {drift.violations.length === 0 ? (
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4 mb-6 flex items-center gap-2 text-sm ${c.muted}`}>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" /> No layering violations across {drift.edges_checked} edges.
+          </div>
+        ) : (
+          <div className="space-y-2 mb-6">
+            {drift.violations.map((v, i) => (
+              <div key={i} className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+                <div className="flex items-center gap-2 mb-1">
+                  <span className={`text-xs font-mono font-medium ${c.heading}`}>{v.from}</span>
+                  <ArrowRight className={`w-3 h-3 ${c.muted}`} />
+                  <span className={`text-xs font-mono font-medium ${c.heading}`}>{v.to}</span>
+                  <Badge color="amber">{v.rule}</Badge>
+                </div>
+                <div className={`text-[11px] ${c.muted}`}>{v.from_layer} → {v.to_layer} (dependency points the wrong way)</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Dead code */}
+        <h2 className={`font-serif text-lg mb-3 ${c.heading}`}>Dead Code</h2>
+        {deadCode.length === 0 ? (
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4 flex items-center gap-2 text-sm ${c.muted}`}>
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" /> No unused symbols detected.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {deadCode.map((d, i) => (
+              <div key={i} className={`${c.surface} border ${c.border} rounded-xl p-4 flex items-center justify-between`}>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <code className={`text-xs font-mono font-medium ${c.heading}`}>{d.symbol}</code>
+                    <Badge color={d.kind === 'orphan-file' ? 'slate' : 'blue'}>{d.kind}</Badge>
+                  </div>
+                  <div className={`text-[11px] font-mono mt-1 ${c.muted}`}>{d.file}</div>
+                </div>
+                <span className={`text-[10px] ${c.muted} shrink-0 ml-4`}>{d.confidence} confidence</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Page: Decision Timeline (commit history + "why") ─────────────────────────
+
+const TIMELINE_MOCK: TimelineReport = {
+  clusters: [
+    {
+      period: '2026-W03', title: 'feat: add OAuth login flow',
+      summary: 'Introduced GitHub OAuth and session handling to replace the stubbed dev login.',
+      commits: [
+        { sha: 'a1b2c3d', message: 'feat: add OAuth login flow', author: 'Ada', date: '2026-01-15T09:00:00Z' },
+        { sha: 'e4f5a6b', message: 'fix: refresh token rotation', author: 'Ada', date: '2026-01-16T14:00:00Z' },
+      ],
+    },
+  ],
+  commit_count: 2,
+  generated_at: '',
+}
+
+function TimelinePage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: (v: boolean) => void; setPage: (p: Page) => void }) {
+  const { repoId, ensureAuth } = useAppState()
+  const [data, setData] = useState<TimelineReport>(TIMELINE_MOCK)
+  const [loading, setLoading] = useState(false)
+  const [live, setLive] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      if (!repoId) return
+      setLoading(true)
+      await ensureAuth()
+      try {
+        const r = await Repos.timeline(repoId)
+        if (!active) return
+        setData(r); setLive(true)
+      } catch { /* keep mock */ }
+      finally { if (active) setLoading(false) }
+    })()
+    return () => { active = false }
+  }, [repoId])
+
+  const c = isDark ? {
+    bg: 'bg-[#242C4D]', surface: 'bg-[#2D355C]', border: 'border-white/[0.06]',
+    text: 'text-white/80', muted: 'text-white/35', heading: 'text-white',
+  } : {
+    bg: 'bg-[#F8F9FC]', surface: 'bg-white', border: 'border-gray-100',
+    text: 'text-gray-700', muted: 'text-gray-400', heading: 'text-gray-900',
+  }
+
+  return (
+    <div className={`flex-1 overflow-y-auto ${c.bg}`}>
+      <TopBar title="Timeline" isDark={isDark} setIsDark={setIsDark} setPage={setPage}
+        breadcrumbs={[{ label: 'Dashboard', page: 'dashboard' }, { label: 'CodeAtreus' }, { label: 'Timeline' }]} />
+      <div className="p-6 max-w-3xl">
+        <div className="flex items-center justify-between mb-1">
+          <h1 className={`font-serif text-2xl ${c.heading}`}>Decision Timeline</h1>
+          {loading && <Loader2 className="w-4 h-4 animate-spin text-blue-400" />}
+        </div>
+        <p className={`text-sm mb-6 ${c.muted}`}>
+          Commit history grouped by week, with an AI summary of what changed and why.{' '}
+          {!repoId ? 'Select a repository.' : live ? `${data.commit_count} commits analysed.` : 'Showing sample data.'}
+        </p>
+
+        <div className="relative pl-6">
+          {/* vertical rail */}
+          <div className={`absolute left-[7px] top-1 bottom-1 w-px ${isDark ? 'bg-white/10' : 'bg-gray-200'}`} />
+          {data.clusters.map((cl, i) => (
+            <motion.div key={i} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.05 }}
+              className="relative mb-6">
+              <div className={`absolute -left-[22px] top-1 w-3.5 h-3.5 rounded-full border-2 ${isDark ? 'bg-[#242C4D] border-blue-500' : 'bg-white border-blue-500'}`} />
+              <div className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className={`text-sm font-medium ${c.heading}`}>{cl.title}</span>
+                  <span className={`text-[10px] font-mono ${c.muted}`}>{cl.period}</span>
+                </div>
+                <p className={`text-xs mb-3 ${c.text}`}>{cl.summary}</p>
+                <div className="space-y-1">
+                  {cl.commits.map((cm, j) => (
+                    <div key={j} className="flex items-center gap-2">
+                      <code className={`text-[10px] font-mono ${c.muted}`}>{cm.sha}</code>
+                      <span className={`text-[11px] truncate ${c.text}`}>{cm.message}</span>
+                      <span className={`text-[10px] ml-auto shrink-0 ${c.muted}`}>{cm.author}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </motion.div>
+          ))}
+          {data.clusters.length === 0 && (
+            <div className={`${c.surface} border ${c.border} rounded-xl p-4 text-sm ${c.muted}`}>
+              No commit history available.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Page: API Docs (generated OpenAPI from route decorators) ─────────────────
+
+const APIDOCS_MOCK: ApiDocs = {
+  openapi: '3.0.0',
+  info: { title: 'CodeAtreus API', version: '1.0.0' },
+  paths: {
+    '/api/repos/{id}/overview': { get: { summary: 'GET /api/repos/{id}/overview', 'x-source-file': 'app/api/repos.py' } },
+    '/api/repos/{id}/chat': { post: { summary: 'POST /api/repos/{id}/chat', 'x-source-file': 'app/api/chat.py' } },
+  },
+}
+
+const METHOD_COLOR: Record<string, string> = {
+  get: 'green', post: 'blue', put: 'amber', delete: 'red', patch: 'purple',
+}
+
+function ApiDocsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: (v: boolean) => void; setPage: (p: Page) => void }) {
+  const { repoId, ensureAuth } = useAppState()
+  const [data, setData] = useState<ApiDocs>(APIDOCS_MOCK)
+  const [loading, setLoading] = useState(false)
+  const [live, setLive] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      if (!repoId) return
+      setLoading(true)
+      await ensureAuth()
+      try {
+        const r = await Repos.apiDocs(repoId)
+        if (!active) return
+        setData(r); setLive(true)
+      } catch { /* keep mock */ }
+      finally { if (active) setLoading(false) }
+    })()
+    return () => { active = false }
+  }, [repoId])
+
+  const c = isDark ? {
+    bg: 'bg-[#242C4D]', surface: 'bg-[#2D355C]', border: 'border-white/[0.06]',
+    text: 'text-white/80', muted: 'text-white/35', heading: 'text-white',
+  } : {
+    bg: 'bg-[#F8F9FC]', surface: 'bg-white', border: 'border-gray-100',
+    text: 'text-gray-700', muted: 'text-gray-400', heading: 'text-gray-900',
+  }
+
+  const paths = Object.entries(data.paths)
+  const endpointCount = paths.reduce((n, [, ops]) => n + Object.keys(ops).length, 0)
+
+  return (
+    <div className={`flex-1 overflow-y-auto ${c.bg}`}>
+      <TopBar title="API Docs" isDark={isDark} setIsDark={setIsDark} setPage={setPage}
+        breadcrumbs={[{ label: 'Dashboard', page: 'dashboard' }, { label: 'CodeAtreus' }, { label: 'API Docs' }]} />
+      <div className="p-6 max-w-4xl">
+        <div className="flex items-center justify-between mb-1">
+          <h1 className={`font-serif text-2xl ${c.heading}`}>{data.info.title}</h1>
+          {loading && <Loader2 className="w-4 h-4 animate-spin text-blue-400" />}
+        </div>
+        <p className={`text-sm mb-6 ${c.muted}`}>
+          OpenAPI {data.openapi} · {endpointCount} endpoint(s) detected from route handlers.{' '}
+          {!repoId ? 'Select a repository.' : live ? 'Generated from source.' : 'Showing sample data.'}
+        </p>
+
+        {paths.length === 0 ? (
+          <div className={`${c.surface} border ${c.border} rounded-xl p-4 text-sm ${c.muted}`}>
+            No HTTP routes detected in this repository.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {paths.map(([path, ops]) => (
+              <div key={path} className={`${c.surface} border ${c.border} rounded-xl p-4`}>
+                <code className={`text-xs font-mono font-medium ${c.heading}`}>{path}</code>
+                <div className="mt-2 space-y-1.5">
+                  {Object.entries(ops).map(([method, op]) => (
+                    <div key={method} className="flex items-center gap-2">
+                      <Badge color={METHOD_COLOR[method] || 'slate'}>{method.toUpperCase()}</Badge>
+                      <span className={`text-[11px] ${c.text}`}>{op.summary}</span>
+                      {op['x-source-file'] && (
+                        <span className={`text-[10px] font-mono ml-auto shrink-0 ${c.muted}`}>{op['x-source-file']}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Page: Settings ─────────────────────────────────────────────────────────
 
 function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDark: (v: boolean) => void; setPage: (p: Page) => void }) {
+  const { repoId, ensureAuth } = useAppState()
   const [activeSection, setActiveSection] = useState('profile')
-  const [apiKey, setApiKey] = useState('sk-or-••••••••••••••••••••••••••••••••••••••••')
+
+  // Live account data (falls back to mock-ish defaults until the fetch lands).
+  const [profile, setProfile] = useState<Profile | null>(null)
+  const [keys, setKeys] = useState<ApiKeys | null>(null)
+  const [usage, setUsage] = useState<Usage | null>(null)
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [orKey, setOrKey] = useState('')      // new OpenRouter key (blank = unchanged)
+  const [ghKey, setGhKey] = useState('')      // new GitHub token (blank = unchanged)
+  const [status, setStatus] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+    ;(async () => {
+      await ensureAuth()
+      try {
+        const [p, k, u] = await Promise.all([
+          UserApi.profile(), UserApi.apiKeys(), UserApi.usage(),
+        ])
+        if (!active) return
+        setProfile(p); setKeys(k); setUsage(u)
+        setName(p.name ?? ''); setEmail(p.email ?? '')
+      } catch { /* backend offline — keep placeholders */ }
+    })()
+    return () => { active = false }
+  }, [])
+
+  const flash = (msg: string) => { setStatus(msg); setTimeout(() => setStatus(null), 2500) }
+
+  const saveProfile = async () => {
+    try { const p = await UserApi.updateProfile({ name, email }); setProfile(p); flash('Profile saved') }
+    catch { flash('Save failed') }
+  }
+  const saveKeys = async () => {
+    try {
+      const body: { openrouter_key?: string; github_token?: string } = {}
+      if (orKey) body.openrouter_key = orKey
+      if (ghKey) body.github_token = ghKey
+      const k = await UserApi.updateApiKeys(body)
+      setKeys(k); setOrKey(''); setGhKey(''); flash('API keys saved')
+    } catch { flash('Save failed') }
+  }
+  const signOut = () => { setToken(null); setPage('landing') }
+  const doDeleteIndex = async () => {
+    if (!repoId) { flash('No active repository'); return }
+    try { await UserApi.deleteIndex(repoId); flash('Index deleted') } catch { flash('Delete failed') }
+  }
+  const doResetData = async () => {
+    try { await UserApi.resetData(); flash('All data reset'); setPage('dashboard') } catch { flash('Reset failed') }
+  }
+  const doDeleteAccount = async () => {
+    try { await UserApi.deleteAccount(); setToken(null); setPage('landing') } catch { flash('Delete failed') }
+  }
+
+  const initials = (profile?.name || profile?.github_login || 'You')
+    .split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase()
 
   const sections = [
     { id: 'profile', label: 'Profile', icon: User },
@@ -2304,11 +2828,13 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
     sidebar: 'bg-white'
   }
 
-  const usageData = [
-    { month: 'May', questions: 167, tokens: 420 },
-    { month: 'Jun', questions: 289, tokens: 710 },
-    { month: 'Jul', questions: 341, tokens: 890 },
-  ]
+  const usageData = usage?.monthly.length
+    ? usage.monthly.map(m => ({ month: m.month, questions: m.questions, tokens: m.tokens }))
+    : [
+        { month: 'May', questions: 167, tokens: 420 },
+        { month: 'Jun', questions: 289, tokens: 710 },
+        { month: 'Jul', questions: 341, tokens: 890 },
+      ]
 
   return (
     <div className={`flex-1 flex flex-col overflow-hidden ${c.bg}`} style={{ height: '100vh' }}>
@@ -2330,7 +2856,10 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
             </button>
           ))}
           <div className="flex-1" />
-          <button className={`flex items-center gap-2 px-2.5 py-2 rounded-md text-xs transition-colors text-red-400/60 hover:text-red-400 hover:bg-red-500/10`}>
+          {status && (
+            <div className="px-2.5 py-2 mb-1 rounded-md text-xs bg-blue-500/10 text-blue-400 border border-blue-500/20">{status}</div>
+          )}
+          <button onClick={signOut} className={`flex items-center gap-2 px-2.5 py-2 rounded-md text-xs transition-colors text-red-400/60 hover:text-red-400 hover:bg-red-500/10`}>
             <LogOut className="w-3.5 h-3.5" />
             Sign out
           </button>
@@ -2348,22 +2877,27 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                   </div>
                   <div className={`${c.surface} border ${c.border} rounded-xl p-5 space-y-4`}>
                     <div className="flex items-center gap-4">
-                      <div className="w-14 h-14 rounded-full bg-blue-600 flex items-center justify-center shrink-0">
-                        <span className="text-xl font-bold text-white">JS</span>
+                      <div className="w-14 h-14 rounded-full bg-blue-600 flex items-center justify-center shrink-0 overflow-hidden">
+                        {profile?.avatar_url
+                          ? <img src={profile.avatar_url} alt="" className="w-full h-full object-cover" />
+                          : <span className="text-xl font-bold text-white">{initials}</span>}
                       </div>
                       <div>
-                        <div className={`text-sm font-medium ${c.heading}`}>John Smith</div>
-                        <div className={`text-xs ${c.muted}`}>john@company.com</div>
-                        <button className="text-xs text-blue-500 hover:text-blue-400 mt-1">Change avatar</button>
+                        <div className={`text-sm font-medium ${c.heading}`}>{profile?.name || profile?.github_login || 'Your account'}</div>
+                        <div className={`text-xs ${c.muted}`}>{profile?.email || '—'}</div>
                       </div>
                     </div>
-                    {[{ label: 'Full Name', value: 'John Smith' }, { label: 'Email', value: 'john@company.com' }, { label: 'Company', value: 'Acme Corp' }].map(f => (
-                      <div key={f.label}>
-                        <label className={`text-xs font-medium block mb-1.5 ${c.muted}`}>{f.label}</label>
-                        <input defaultValue={f.value} className={`w-full px-3 py-2 rounded-md border text-sm outline-none ${c.input}`} />
-                      </div>
-                    ))}
-                    <button className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-md transition-colors">Save changes</button>
+                    <div>
+                      <label className={`text-xs font-medium block mb-1.5 ${c.muted}`}>Full Name</label>
+                      <input value={name} onChange={e => setName(e.target.value)}
+                        className={`w-full px-3 py-2 rounded-md border text-sm outline-none ${c.input}`} />
+                    </div>
+                    <div>
+                      <label className={`text-xs font-medium block mb-1.5 ${c.muted}`}>Email</label>
+                      <input value={email} onChange={e => setEmail(e.target.value)}
+                        className={`w-full px-3 py-2 rounded-md border text-sm outline-none ${c.input}`} />
+                    </div>
+                    <button onClick={saveProfile} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-md transition-colors">Save changes</button>
                   </div>
 
                   <div className={`${c.surface} border ${c.border} rounded-xl p-5`}>
@@ -2371,11 +2905,16 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                       <Github className={`w-4 h-4 ${c.muted}`} />
                       <div>
                         <div className={`text-sm font-medium ${c.heading}`}>GitHub Connection</div>
-                        <div className={`text-xs ${c.muted}`}>Connected as @johnsmith</div>
+                        <div className={`text-xs ${c.muted}`}>
+                          {profile?.github_connected
+                            ? `Connected as @${profile.github_login}`
+                            : 'Not connected'}
+                        </div>
                       </div>
-                      <Badge color="green">Connected</Badge>
+                      <Badge color={profile?.github_connected ? 'green' : 'slate'}>
+                        {profile?.github_connected ? 'Connected' : 'Disconnected'}
+                      </Badge>
                     </div>
-                    <button className={`text-xs border px-3 py-1.5 rounded-md transition-colors ${isDark ? 'border-white/10 text-white/40 hover:bg-white/5' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>Disconnect</button>
                   </div>
                 </div>
               )}
@@ -2413,23 +2952,22 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                     <p className={`text-xs ${c.muted}`}>Manage third-party API integrations.</p>
                   </div>
                   <div className={`${c.surface} border ${c.border} rounded-xl p-5 space-y-5`}>
-                    {[
-                      { label: 'OpenRouter API Key', desc: 'Used for AI chat and embeddings', prefix: 'sk-or-' },
-                      { label: 'GitHub Personal Token', desc: 'Access private repositories', prefix: 'ghp_' },
-                    ].map(k => (
+                    {([
+                      { label: 'OpenRouter API Key', desc: 'Used for AI chat (falls back to the server key if unset)', isSet: keys?.openrouter_set, preview: keys?.openrouter_key, value: orKey, set: setOrKey, placeholder: 'sk-or-v1-…' },
+                      { label: 'GitHub Personal Token', desc: 'Access private repositories', isSet: keys?.github_set, preview: keys?.github_token, value: ghKey, set: setGhKey, placeholder: 'ghp_…' },
+                    ] as const).map(k => (
                       <div key={k.label}>
                         <label className={`text-xs font-medium block mb-1 ${c.heading}`}>{k.label}</label>
-                        <div className={`text-[10px] mb-2 ${c.muted}`}>{k.desc}</div>
-                        <div className="flex gap-2">
-                          <input type="password" defaultValue={`${k.prefix}••••••••••••••••••••••••••••••••••••`}
-                            className={`flex-1 px-3 py-2 rounded-md border text-xs outline-none font-mono ${c.input}`} />
-                          <button className={`px-3 py-2 rounded-md border text-xs transition-colors ${isDark ? 'border-white/10 text-white/50 hover:bg-white/5' : 'border-gray-200 text-gray-500 hover:bg-gray-50'}`}>
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
+                        <div className={`text-[10px] mb-2 ${c.muted}`}>
+                          {k.desc}{k.isSet && k.preview ? ` · current: ${k.preview}` : ' · not set'}
                         </div>
+                        <input type="password" value={k.value} onChange={e => k.set(e.target.value)}
+                          placeholder={k.isSet ? 'Enter a new key to replace' : k.placeholder}
+                          className={`w-full px-3 py-2 rounded-md border text-xs outline-none font-mono ${c.input}`} />
                       </div>
                     ))}
-                    <button className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-md transition-colors">Save API Keys</button>
+                    <button onClick={saveKeys} disabled={!orKey && !ghKey}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs rounded-md transition-colors">Save API Keys</button>
                   </div>
                 </div>
               )}
@@ -2442,9 +2980,9 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                   </div>
                   <div className="grid grid-cols-3 gap-3">
                     {[
-                      { label: 'Repos Indexed', value: '5', icon: GitBranch, color: 'text-blue-400' },
-                      { label: 'Questions Asked', value: '1,247', icon: MessageSquare, color: 'text-purple-400' },
-                      { label: 'Tokens Used', value: '2.02M', icon: Cpu, color: 'text-emerald-400' },
+                      { label: 'Repos Indexed', value: (usage?.repos_indexed ?? 0).toLocaleString(), icon: GitBranch, color: 'text-blue-400' },
+                      { label: 'Questions Asked', value: (usage?.questions_asked ?? 0).toLocaleString(), icon: MessageSquare, color: 'text-purple-400' },
+                      { label: 'Tokens Used', value: fmtTokens(usage?.tokens_used ?? 0), icon: Cpu, color: 'text-emerald-400' },
                     ].map(s => (
                       <div key={s.label} className={`${c.surface} border ${c.border} rounded-xl p-4`}>
                         <s.icon className={`w-4 h-4 mb-2 ${s.color}`} />
@@ -2467,16 +3005,23 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                   </div>
                   <div className={`${c.surface} border ${c.border} rounded-xl p-5`}>
                     <div className="flex items-center justify-between mb-2">
-                      <div className={`text-sm font-medium ${c.heading}`}>Plan: Pro</div>
+                      <div className={`text-sm font-medium ${c.heading}`}>Plan: {(usage?.plan ?? 'free').replace(/^\w/, ch => ch.toUpperCase())}</div>
                       <Badge color="blue">Active</Badge>
                     </div>
-                    <div className={`text-xs ${c.muted} mb-3`}>Renews August 19, 2025</div>
-                    <div className="flex items-center gap-2 mb-1">
-                      <div className={`flex-1 h-1.5 rounded-full ${isDark ? 'bg-white/5' : 'bg-gray-100'}`}>
-                        <div className="h-full rounded-full bg-blue-600" style={{ width: '61%' }} />
-                      </div>
-                      <span className={`text-xs font-mono ${c.muted}`}>1.24M / 2M tokens</span>
-                    </div>
+                    {usage && usage.token_budget > 0 ? (
+                      <>
+                        <div className={`text-xs ${c.muted} mb-3`}>Monthly token budget</div>
+                        <div className="flex items-center gap-2 mb-1">
+                          <div className={`flex-1 h-1.5 rounded-full ${isDark ? 'bg-white/5' : 'bg-gray-100'}`}>
+                            <div className="h-full rounded-full bg-blue-600"
+                              style={{ width: `${Math.min(100, Math.round((usage.tokens_used / usage.token_budget) * 100))}%` }} />
+                          </div>
+                          <span className={`text-xs font-mono ${c.muted}`}>{fmtTokens(usage.tokens_used)} / {fmtTokens(usage.token_budget)} tokens</span>
+                        </div>
+                      </>
+                    ) : (
+                      <div className={`text-xs ${c.muted}`}>Unlimited tokens on this plan.</div>
+                    )}
                   </div>
                 </div>
               )}
@@ -2488,16 +3033,16 @@ function SettingsPage({ isDark, setIsDark, setPage }: { isDark: boolean; setIsDa
                     <p className={`text-xs ${c.muted}`}>These actions are irreversible. Proceed with caution.</p>
                   </div>
                   {[
-                    { label: 'Delete Repository Index', desc: 'Remove all embeddings and knowledge graph for CodeAtreus. This cannot be undone.', btn: 'Delete Index' },
-                    { label: 'Reset All Data', desc: 'Delete all repositories, chat history, and embeddings across your account.', btn: 'Reset Account' },
-                    { label: 'Delete Account', desc: 'Permanently delete your account and all associated data.', btn: 'Delete Account' },
+                    { label: 'Delete Repository Index', desc: 'Remove embeddings, graph, and clone for the active repository. It can be re-imported later.', btn: 'Delete Index', onClick: doDeleteIndex },
+                    { label: 'Reset All Data', desc: 'Delete all repositories, chat history, and embeddings across your account.', btn: 'Reset Account', onClick: doResetData },
+                    { label: 'Delete Account', desc: 'Permanently delete your account and all associated data.', btn: 'Delete Account', onClick: doDeleteAccount },
                   ].map(d => (
                     <div key={d.label} className={`${c.surface} border border-red-500/20 rounded-xl p-5 flex items-center justify-between`}>
                       <div>
                         <div className={`text-sm font-medium ${c.heading}`}>{d.label}</div>
                         <div className={`text-xs ${c.muted} max-w-xs`}>{d.desc}</div>
                       </div>
-                      <button className="ml-4 shrink-0 px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs rounded-md transition-colors font-medium">
+                      <button onClick={d.onClick} className="ml-4 shrink-0 px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 text-xs rounded-md transition-colors font-medium">
                         {d.btn}
                       </button>
                     </div>
@@ -2549,7 +3094,7 @@ export default function App() {
     document.documentElement.classList.toggle('dark', isDark)
   }, [isDark])
 
-  const appPages: Page[] = ['dashboard', 'import', 'indexing', 'overview', 'chat', 'graph', 'flow', 'sequence', 'roadmap', 'search', 'settings']
+  const appPages: Page[] = ['dashboard', 'import', 'indexing', 'overview', 'chat', 'graph', 'flow', 'sequence', 'roadmap', 'search', 'security', 'insights', 'timeline', 'apidocs', 'settings']
   const isAppPage = appPages.includes(page)
 
   const renderPage = () => {
@@ -2567,6 +3112,10 @@ export default function App() {
       case 'sequence': return <SequencePage {...props} />
       case 'roadmap': return <RoadmapPage {...props} />
       case 'search': return <SearchPage {...props} />
+      case 'security': return <SecurityPage {...props} />
+      case 'insights': return <InsightsPage {...props} />
+      case 'timeline': return <TimelinePage {...props} />
+      case 'apidocs': return <ApiDocsPage {...props} />
       case 'settings': return <SettingsPage {...props} />
     }
   }

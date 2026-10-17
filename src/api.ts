@@ -82,6 +82,7 @@ async function request<T>(method: string, path: string, body?: unknown, _retried
 export const api = {
   get: <T,>(p: string) => request<T>('GET', p),
   post: <T,>(p: string, body?: unknown) => request<T>('POST', p, body),
+  put: <T,>(p: string, body?: unknown) => request<T>('PUT', p, body),
   del: <T,>(p: string) => request<T>('DELETE', p),
 }
 
@@ -112,6 +113,40 @@ export interface Architecture { summary: string; modules: ArchitectureModule[]; 
 export interface ImportantFile { path: string; tags: string[] }
 export interface DashboardStats { repos_indexed: number; questions_asked: number; tokens_used: number }
 export interface ActivityPoint { date: string; repos: number; questions: number }
+export interface SecretFinding { file: string; line: number; rule: string; severity: string; preview: string }
+export interface Vulnerability {
+  package: string; version: string; ecosystem: string; id: string
+  severity: string; summary: string; fixed_in: string | null
+}
+export interface SecurityReport {
+  secrets: SecretFinding[]; vulnerabilities: Vulnerability[]
+  dependencies_scanned: number; scanned_at: string
+}
+export interface TimelineCommit { sha: string; message: string; author: string; date: string }
+export interface TimelineCluster { period: string; title: string; summary: string; commits: TimelineCommit[] }
+export interface TimelineReport { clusters: TimelineCluster[]; commit_count: number; generated_at: string }
+export interface ApiDocsOperation { summary?: string; 'x-source-file'?: string }
+export interface ApiDocs {
+  openapi: string
+  info: { title: string; version: string }
+  paths: Record<string, Record<string, ApiDocsOperation>>
+}
+export interface DeadCodeItem { file: string; symbol: string; kind: string; confidence: string }
+export interface DriftViolation { from: string; to: string; from_layer: string; to_layer: string; rule: string }
+export interface DriftReport { violations: DriftViolation[]; score: number; edges_checked: number }
+export interface Profile {
+  id: string; name: string | null; email: string | null; avatar_url: string | null
+  github_login: string | null; github_connected: boolean; plan: string
+}
+export interface ApiKeys {
+  openrouter_key: string | null; github_token: string | null
+  openrouter_set: boolean; github_set: boolean
+}
+export interface MonthlyUsage { month: string; questions: number; tokens: number }
+export interface Usage {
+  repos_indexed: number; questions_asked: number; tokens_used: number
+  plan: string; token_budget: number; monthly: MonthlyUsage[]
+}
 
 // ── Endpoint wrappers ─────────────────────────────────────────────────────────
 export const Auth = {
@@ -136,12 +171,28 @@ export const Repos = {
   roadmap: (id: string) => api.get<{ days: RoadmapDay[] }>(`/repos/${id}/roadmap`),
   architecture: (id: string) => api.post<Architecture>(`/repos/${id}/architecture-summary`),
   importantFiles: (id: string) => api.get<ImportantFile[]>(`/repos/${id}/important-files`),
-  apiDocs: (id: string) => api.get<{ openapi: string; info: unknown; paths: Record<string, unknown> }>(`/repos/${id}/api-docs`),
+  apiDocs: (id: string) => api.get<ApiDocs>(`/repos/${id}/api-docs`),
+  security: (id: string) => api.get<SecurityReport>(`/repos/${id}/security`),
+  deadCode: (id: string) => api.get<DeadCodeItem[]>(`/repos/${id}/dead-code`),
+  drift: (id: string) => api.get<DriftReport>(`/repos/${id}/drift`),
+  timeline: (id: string) => api.get<TimelineReport>(`/repos/${id}/timeline`),
 }
 
 export const Dashboard = {
   stats: () => api.get<DashboardStats>('/dashboard/stats'),
   activity: () => api.get<ActivityPoint[]>('/dashboard/activity'),
+}
+
+export const UserApi = {
+  profile: () => api.get<Profile>('/user/profile'),
+  updateProfile: (body: { name?: string; email?: string }) => api.put<Profile>('/user/profile', body),
+  apiKeys: () => api.get<ApiKeys>('/user/api-keys'),
+  updateApiKeys: (body: { openrouter_key?: string; github_token?: string }) =>
+    api.put<ApiKeys>('/user/api-keys', body),
+  usage: () => api.get<Usage>('/user/usage'),
+  deleteIndex: (repoId: string) => api.del<void>(`/repos/${repoId}/index`),
+  resetData: () => api.del<void>('/user/data'),
+  deleteAccount: () => api.del<void>('/user'),
 }
 
 // ── SSE chat streaming ────────────────────────────────────────────────────────

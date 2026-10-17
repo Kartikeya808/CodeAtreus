@@ -6,7 +6,7 @@ from app.db.session import SessionLocal
 from app.models.index_job import IndexJob
 from app.models.repo import Repo
 from app.services.indexing.chunker import chunk_files
-from app.services.indexing.clone import clone_repo
+from app.services.indexing.clone import clone_repo, head_commit_sha
 from app.services.indexing.graph import build_graph
 from app.services.indexing.metadata import extract_metadata
 from app.services.indexing.progress import ProgressReporter
@@ -34,6 +34,7 @@ def run_index_pipeline(repo_id: str, job_id: str) -> None:
         reporter.step(1, "Git Clone", f"Cloning {repo.full_name}…")
         clone_path = clone_repo(repo.github_url, repo.default_branch, repo.id)
         repo.local_path = str(clone_path)
+        repo.indexed_commit_sha = head_commit_sha(clone_path)
         walk = walk_repo(clone_path)
         reporter.log(f"Cloned {walk.file_count} source files ({walk.total_bytes // 1024} KB)")
 

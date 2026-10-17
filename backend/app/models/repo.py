@@ -58,10 +58,17 @@ class Repo(UUIDMixin, TimestampMixin, Base):
     graph: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     # Cached LLM architecture summary (regenerated on re-index). {modules:[...], summary}
     architecture: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    # Cached security scan (Phase 4.2): {secrets:[...], vulnerabilities:[...], scanned_at}
+    security: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
+    # Cached decision timeline (Phase 4.1): {clusters:[...], generated_at}
+    timeline: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
 
     # Local clone path + chroma collection name.
     local_path: Mapped[str | None] = mapped_column(String(1024), default=None)
     chroma_collection: Mapped[str | None] = mapped_column(String(128), default=None)
+    # Commit sha the current index was built from (Phase 4.6: incremental re-index
+    # skip + LLM cache invalidation key).
+    indexed_commit_sha: Mapped[str | None] = mapped_column(String(40), default=None)
 
     owner: Mapped[User] = relationship(back_populates="repos")
     jobs: Mapped[list[IndexJob]] = relationship(

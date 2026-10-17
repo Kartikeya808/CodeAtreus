@@ -62,6 +62,9 @@ class _KeywordStore:
         ]
         self.path.write_text(json.dumps(records), encoding="utf-8")
 
+    def delete(self) -> None:
+        self.path.unlink(missing_ok=True)
+
     def query(self, text: str, k: int) -> list[Retrieved]:
         if not self.path.exists():
             return []
@@ -119,6 +122,12 @@ class _ChromaStore:
             metadatas=[{"path": c.path, "start_line": c.start_line} for c in chunks],
         )
 
+    def delete(self) -> None:
+        try:
+            self._client.delete_collection(name=self._collection.name)
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logger.info("chroma delete_collection failed: %s", exc)
+
     def query(self, text: str, k: int) -> list[Retrieved]:
         res = self._collection.query(query_texts=[text], n_results=k)
         out: list[Retrieved] = []
@@ -162,3 +171,7 @@ class VectorStore:
 
     def query(self, text: str, k: int = 6) -> list[Retrieved]:
         return self._backend.query(text, k)  # type: ignore[attr-defined]
+
+    def delete(self) -> None:
+        """Remove this repo's collection/index (used when deleting a repo)."""
+        self._backend.delete()  # type: ignore[attr-defined]

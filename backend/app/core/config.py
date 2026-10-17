@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
+    # Key for encrypting secrets at rest (BYO API keys, GitHub tokens). Falls
+    # back to jwt_secret when unset, so no new env var is required to deploy.
+    encryption_key: str = ""
+
+    # ── Plans / rate limiting (Phase 4.6) ────────────────────────────────────
+    # Monthly LLM-token budget per plan. 0 disables the limit for that plan.
+    free_monthly_token_budget: int = 2_000_000
+    pro_monthly_token_budget: int = 0  # unlimited
 
     # Allow passwordless "guest" login in production: each call provisions a
     # fresh, isolated anonymous account (clean slate per new visitor). Off by

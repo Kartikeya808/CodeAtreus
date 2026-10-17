@@ -9,13 +9,13 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import enforce_token_budget, get_current_user
 from app.db.session import SessionLocal, get_db
 from app.models.chat import ChatMessage, ChatRole, ChatSession
 from app.models.repo import Repo, RepoStatus
 from app.models.user import User
 from app.schemas.chat import ChatMessageOut, ChatRequest, ChatResponse
-from app.services import llm
+from app.services import crypto, llm, llm_cache
 from app.services.vectorstore import VectorStore
 
 router = APIRouter()
@@ -88,16 +88,27 @@ def _persist(
 async def chat(
     repo_id: str,
     body: ChatRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(enforce_token_budget),
     db: Session = Depends(get_db),
 ) -> ChatResponse:
     repo = _owned_ready_repo(repo_id, user, db)
     session = _get_or_create_session(repo, db)
-    context_blocks, cited = _retrieve(repo, body.message)
 
-    result = await llm.complete(body.message, context_blocks)
+    # Cache hit: identical question against the same indexed commit — skip the LLM.
+    key = llm_cache.make_key(repo.id, repo.indexed_commit_sha, body.message)
+    cached = llm_cache.get(db, key)
+    if cached is not None:
+        _persist(db, session.id, body.message, cached.answer, cached.files, None)
+        return ChatResponse(answer=cached.answer, files=cached.files)
+
+    context_blocks, cited = _retrieve(repo, body.message)
+    user_key = crypto.decrypt(user.openrouter_api_key)
+    result = await llm.complete(body.message, context_blocks, api_key=user_key)
     answer = result["answer"]
     _persist(db, session.id, body.message, answer, cited, result.get("usage"))
+    # Only cache real LLM answers (usage present), not offline fallbacks.
+    if result.get("usage"):
+        llm_cache.put(db, repo.id, key, body.message, answer, cited)
     return ChatResponse(answer=answer, files=cited)
 
 
@@ -105,18 +116,40 @@ async def chat(
 async def chat_stream(
     repo_id: str,
     body: ChatRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(enforce_token_budget),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """SSE token stream. Emits a `sources` event, then `token` events, then `done`."""
     repo = _owned_ready_repo(repo_id, user, db)
     session = _get_or_create_session(repo, db)
+    key = llm_cache.make_key(repo.id, repo.indexed_commit_sha, body.message)
+    cached = llm_cache.get(db, key)
+    if cached is not None:
+        cached_answer, cached_files = cached.answer, cached.files
+
+        async def cached_gen() -> AsyncIterator[str]:
+            yield f"event: sources\ndata: {json.dumps({'files': cached_files})}\n\n"
+            yield f"event: token\ndata: {json.dumps({'text': cached_answer})}\n\n"
+            stream_db = SessionLocal()
+            try:
+                _persist(stream_db, session.id, body.message, cached_answer, cached_files, None)
+            finally:
+                stream_db.close()
+            yield f"event: done\ndata: {json.dumps({'files': cached_files})}\n\n"
+
+        return StreamingResponse(
+            cached_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     context_blocks, cited = _retrieve(repo, body.message)
+    user_key = crypto.decrypt(user.openrouter_api_key)
 
     async def event_gen() -> AsyncIterator[str]:
         yield f"event: sources\ndata: {json.dumps({'files': cited})}\n\n"
         collected: list[str] = []
-        async for chunk in llm.stream(body.message, context_blocks):
+        async for chunk in llm.stream(body.message, context_blocks, api_key=user_key):
             collected.append(chunk)
             yield f"event: token\ndata: {json.dumps({'text': chunk})}\n\n"
         answer = "".join(collected)
@@ -125,6 +158,9 @@ async def chat_stream(
         stream_db = SessionLocal()
         try:
             _persist(stream_db, session.id, body.message, answer, cited, None)
+            # Cache the streamed answer when an LLM key is configured.
+            if llm.llm_configured(user_key):
+                llm_cache.put(stream_db, repo.id, key, body.message, answer, cited)
         finally:
             stream_db.close()
         yield f"event: done\ndata: {json.dumps({'files': cited})}\n\n"

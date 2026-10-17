@@ -37,3 +37,27 @@ def get_current_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
+
+
+def enforce_token_budget(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """Reject requests once a user exceeds their monthly LLM-token budget.
+
+    DB-backed (no Redis): the budget is derived from the user's plan and the
+    tokens already recorded on this month's assistant messages. A plan budget of
+    0 means unlimited. Users with their own OpenRouter key are never limited.
+    """
+    from app.services import crypto, usage
+
+    if crypto.decrypt(user.openrouter_api_key):
+        return user  # BYO key — not on our budget
+    budget = usage.token_budget(user.plan)
+    if budget and usage.tokens_used_this_month(db, user.id) >= budget:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly token budget exceeded. Add your own OpenRouter key in "
+            "Settings to continue.",
+        )
+    return user

@@ -17,6 +17,7 @@ ignore = ["B008"]  # FastAPI uses function calls (Depends) in argument defaults
 "alembic/*" = ["E402"]
 # Regex pattern tables read better unwrapped than split across lines.
 "app/services/indexing/symbols.py" = ["E501"]
+"app/services/security.py" = ["E501"]
 "tests/conftest.py" = ["E402"]
 
 [tool.mypy]

@@ -24,6 +24,7 @@ from app.schemas.auth import (
     TokenPair,
     UserOut,
 )
+from app.services import crypto
 from app.services.github_oauth import GithubOAuthError, exchange_code_for_profile
 
 router = APIRouter()
@@ -38,7 +39,7 @@ def _upsert_github_user(db: Session, profile) -> User:
     user.name = profile.name
     user.email = profile.email
     user.avatar_url = profile.avatar_url
-    user.github_access_token = profile.access_token
+    user.github_access_token = crypto.encrypt(profile.access_token)
     db.commit()
     db.refresh(user)
     return user
@@ -107,14 +108,14 @@ def dev_login(db: Session = Depends(get_db)) -> TokenPair:
         db.refresh(user)
         return TokenPair(**create_token_pair(user.id))
 
-    user = db.scalar(select(User).where(User.github_login == "dev"))
-    if user is None:
-        user = User(
+    dev_user = db.scalar(select(User).where(User.github_login == "dev"))
+    if dev_user is None:
+        dev_user = User(
             github_login="dev",
             name="Dev User",
             email="dev@codeatreus.local",
         )
-        db.add(user)
+        db.add(dev_user)
         db.commit()
-        db.refresh(user)
-    return TokenPair(**create_token_pair(user.id))
+        db.refresh(dev_user)
+    return TokenPair(**create_token_pair(dev_user.id))
