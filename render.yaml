@@ -54,6 +54,12 @@ services:
       # Render auto-generates a strong value and keeps it stable across deploys.
       - key: JWT_SECRET
         generateValue: true
+      # Encrypts BYO API keys / GitHub tokens at rest (Phase 4 settings). Stable
+      # across deploys so stored secrets stay decryptable. If unset, the app
+      # derives a key from JWT_SECRET — but then rotating JWT_SECRET would break
+      # decryption, so keep this set independently.
+      - key: ENCRYPTION_KEY
+        generateValue: true
       # --- Secrets: paste these in the Render dashboard (never committed) ---
       - key: DATABASE_URL
         sync: false
